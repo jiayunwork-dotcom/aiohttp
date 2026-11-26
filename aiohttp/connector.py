@@ -36,6 +36,7 @@ import aiohappyeyeballs
 from . import hdrs, helpers
 from .abc import AbstractResolver, ResolveResult
 from .client_exceptions import (
+    ClientAddressNotAllowedError,
     ClientConnectionError,
     ClientConnectorCertificateError,
     ClientConnectorDNSError,
@@ -58,6 +59,7 @@ from .helpers import (
     set_exception,
     set_result,
 )
+from .networks import AllowNetworksInput, NetworkPolicy
 from .resolver import DefaultResolver
 
 if TYPE_CHECKING:
@@ -90,6 +92,33 @@ NEEDS_CLEANUP_CLOSED = (3, 13, 0) <= sys.version_info < (
 
 
 __all__ = ("BaseConnector", "TCPConnector", "UnixConnector", "NamedPipeConnector")
+
+
+def _request_network_policy(req: Any) -> NetworkPolicy:
+    """Return a request's policy while tolerating old test/request doubles."""
+    unrestricted = NetworkPolicy.parse(None)
+    if req is None:
+        return unrestricted
+    if isinstance(req, NetworkPolicy):
+        return req
+    if isinstance(req, (str, bytes, list, tuple, set, frozenset)):
+        return NetworkPolicy.parse(req)
+
+    policy = getattr(req, "network_policy", None)
+    if isinstance(policy, NetworkPolicy):
+        return policy
+
+    allow_networks = getattr(req, "allow_networks", None)
+    if isinstance(allow_networks, NetworkPolicy):
+        return allow_networks
+    if allow_networks is None:
+        return unrestricted
+    if isinstance(allow_networks, (str, bytes, list, tuple, set, frozenset)):
+        return NetworkPolicy.parse(allow_networks)
+
+    # Mock objects and unrelated request doubles preserve legacy connector
+    # behavior unless they expose a real policy or concrete network list.
+    return unrestricted
 
 
 if TYPE_CHECKING:
@@ -522,7 +551,7 @@ class BaseConnector:
     ) -> Connection:
         """Get from pool or create new connection."""
         key = req.connection_key
-        if (conn := await self._get(key, traces)) is not None:
+        if (conn := await self._get(key, traces, req)) is not None:
             # If we do not have to wait and we can get a connection from the pool
             # we can avoid the timeout ceil logic and directly return the connection
             return conn
@@ -530,7 +559,7 @@ class BaseConnector:
         async with ceil_timeout(timeout.connect, timeout.ceil_threshold):
             if self._available_connections(key) <= 0:
                 await self._wait_for_available_connection(key, traces)
-                if (conn := await self._get(key, traces)) is not None:
+                if (conn := await self._get(key, traces, req)) is not None:
                     return conn
 
             placeholder = cast(ResponseHandler, _TransportPlaceholder())
@@ -613,7 +642,12 @@ class BaseConnector:
             attempts += 1
 
     async def _get(
-        self, key: "ConnectionKey", traces: List["Trace"]
+        self,
+        key: "ConnectionKey",
+        traces: List["Trace"],
+        req: Optional[ClientRequest] = None,
+        *,
+        allow_networks: AllowNetworksInput = None,
     ) -> Optional[Connection]:
         """Get next reusable connection for the key or None.
 
@@ -622,12 +656,27 @@ class BaseConnector:
         if (conns := self._conns.get(key)) is None:
             return None
 
+        policy_source = allow_networks if allow_networks is not None else req
+        policy = _request_network_policy(policy_source)
+
         t1 = monotonic()
+        # Fresh pooled connections which this request's policy rejects are
+        # preserved for another request with a broader/different policy.
+        denied: List[Tuple[ResponseHandler, float]] = []
         while conns:
             proto, t0 = conns.popleft()
             # We will we reuse the connection if its connected and
             # the keepalive timeout has not been exceeded
             if proto.is_connected() and t1 - t0 <= self._keepalive_timeout:
+                if not policy.allows_transport(proto.transport):
+                    denied.append((proto, t0))
+                    continue
+
+                if denied:
+                    # Restore rejected entries ahead of the remaining queue,
+                    # preserving their original order and keep-alive stamp.
+                    conns.extendleft(reversed(denied))
+                    denied.clear()
                 if not conns:
                     # The very last connection was reclaimed: drop the key
                     del self._conns[key]
@@ -650,8 +699,13 @@ class BaseConnector:
             if not self._cleanup_closed_disabled and key.is_ssl:
                 self._cleanup_closed_transports.append(transport)
 
-        # No more connections: drop the key
-        del self._conns[key]
+        # No more immediately usable connections.  Keep policy-rejected fresh
+        # entries in the pool; they may be usable by a concurrent request with
+        # another allow_networks list.
+        if denied:
+            self._conns[key] = deque(denied)
+        else:
+            del self._conns[key]
         return None
 
     def _release_waiter(self) -> None:
@@ -912,11 +966,22 @@ class TCPConnector(BaseConnector):
             self._cached_hosts.clear()
 
     async def _resolve_host(
-        self, host: str, port: int, traces: Optional[Sequence["Trace"]] = None
+        self,
+        host: str,
+        port: int,
+        traces: Optional[Sequence["Trace"]] = None,
+        allow_networks: AllowNetworksInput = None,
     ) -> List[ResolveResult]:
-        """Resolve host and return list of addresses."""
+        """Resolve host and return list of addresses.
+
+        ``allow_networks`` only filters the returned list for this caller.
+        The shared DNS cache always stores the complete resolver result so
+        that concurrent requests with different policies cannot inherit an
+        allow/deny decision from one another.
+        """
+        network_policy = NetworkPolicy.parse(allow_networks)
         if is_ip_address(host):
-            return [
+            hosts = [
                 {
                     "hostname": host,
                     "host": host,
@@ -926,6 +991,9 @@ class TCPConnector(BaseConnector):
                     "flags": 0,
                 }
             ]
+            return cast(
+                List[ResolveResult], network_policy.filter_resolve_results(hosts)
+            )
 
         if not self._use_dns_cache:
 
@@ -939,7 +1007,7 @@ class TCPConnector(BaseConnector):
                 for trace in traces:
                     await trace.send_dns_resolvehost_end(host)
 
-            return res
+            return cast(List[ResolveResult], network_policy.filter_resolve_results(res))
 
         key = (host, port)
         if key in self._cached_hosts and not self._cached_hosts.expired(key):
@@ -949,7 +1017,9 @@ class TCPConnector(BaseConnector):
             if traces:
                 for trace in traces:
                     await trace.send_dns_cache_hit(host)
-            return result
+            return cast(
+                List[ResolveResult], network_policy.filter_resolve_results(result)
+            )
 
         futures: Set["asyncio.Future[None]"]
         #
@@ -970,7 +1040,10 @@ class TCPConnector(BaseConnector):
                 await future
             finally:
                 futures.discard(future)
-            return self._cached_hosts.next_addrs(key)
+            result = self._cached_hosts.next_addrs(key)
+            return cast(
+                List[ResolveResult], network_policy.filter_resolve_results(result)
+            )
 
         # update dict early, before any await (#4014)
         self._throttle_dns_futures[key] = futures = set()
@@ -992,7 +1065,10 @@ class TCPConnector(BaseConnector):
             resolved_host_task.add_done_callback(self._resolve_host_tasks.discard)
 
         try:
-            return await asyncio.shield(resolved_host_task)
+            addrs = await asyncio.shield(resolved_host_task)
+            return cast(
+                List[ResolveResult], network_policy.filter_resolve_results(addrs)
+            )
         except asyncio.CancelledError:
 
             def drop_exception(fut: "asyncio.Future[List[ResolveResult]]") -> None:
@@ -1350,6 +1426,10 @@ class TCPConnector(BaseConnector):
             host = host.rstrip(".") + "."
         port = req.port
         assert port is not None
+        policy = _request_network_policy(req)
+        if policy.enabled and not policy.networks:
+            # Explicit allow_networks=[] is deny-all; do not leak a DNS query.
+            raise ClientAddressNotAllowedError(host=host, port=port, allow_networks=[])
         try:
             # Cancelling this lookup should not cancel the underlying lookup
             #  or else the cancel event will get broadcast to all the waiters
@@ -1361,6 +1441,15 @@ class TCPConnector(BaseConnector):
             # in case of proxy it is not ClientProxyConnectionError
             # it is problem of resolving proxy ip itself
             raise ClientConnectorDNSError(req.connection_key, exc) from exc
+
+        hosts = cast(List[ResolveResult], policy.filter_resolve_results(hosts))
+        if policy.enabled and not hosts:
+            networks = policy.networks or ()
+            raise ClientAddressNotAllowedError(
+                host=host,
+                port=port,
+                allow_networks=[str(network) for network in networks],
+            )
 
         last_exc: Optional[Exception] = None
         addr_infos = self._convert_hosts_to_addr_infos(hosts)
@@ -1426,6 +1515,10 @@ class TCPConnector(BaseConnector):
             loop=self._loop,
             ssl=req.ssl,
         )
+        # The request policy constrains the actual TCP peer.  For proxied
+        # requests that is the proxy; target-address validation through
+        # CONNECT is intentionally outside the direct-only feature scope.
+        proxy_req._set_network_policy(_request_network_policy(req))
 
         # create connection to proxy server
         transport, proto = await self._create_direct_connection(

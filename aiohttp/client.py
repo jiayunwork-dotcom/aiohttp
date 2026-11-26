@@ -40,6 +40,8 @@ from . import hdrs, http, payload
 from ._websocket.reader import WebSocketDataQueue
 from .abc import AbstractCookieJar
 from .client_exceptions import (
+    AddressNotAllowedError,
+    ClientAddressNotAllowedError,
     ClientConnectionError,
     ClientConnectionResetError,
     ClientConnectorCertificateError,
@@ -102,11 +104,14 @@ from .helpers import (
 )
 from .http import WS_KEY, HttpVersion, WebSocketReader, WebSocketWriter
 from .http_websocket import WSHandshakeError, ws_ext_gen, ws_ext_parse
+from .networks import AllowNetworksInput, NetworkPolicy
 from .tracing import Trace, TraceConfig
 from .typedefs import JSONEncoder, LooseCookies, LooseHeaders, Query, StrOrURL
 
 __all__ = (
     # client_exceptions
+    "ClientAddressNotAllowedError",
+    "AddressNotAllowedError",
     "ClientConnectionError",
     "ClientConnectionResetError",
     "ClientConnectorCertificateError",
@@ -191,6 +196,7 @@ class _RequestOptions(TypedDict, total=False):
     auto_decompress: Union[bool, None]
     max_line_size: Union[int, None]
     max_field_size: Union[int, None]
+    allow_networks: AllowNetworksInput
 
 
 @attr.s(auto_attribs=True, frozen=True, slots=True)
@@ -502,6 +508,7 @@ class ClientSession:
         auto_decompress: Optional[bool] = None,
         max_line_size: Optional[int] = None,
         max_field_size: Optional[int] = None,
+        allow_networks: AllowNetworksInput = None,
     ) -> ClientResponse:
 
         # NOTE: timeout clamps existing connect and read timeouts.  We cannot
@@ -512,6 +519,11 @@ class ClientSession:
             raise RuntimeError("Session is closed")
 
         ssl = _merge_ssl_params(ssl, verify_ssl, ssl_context, fingerprint)
+
+        # Parse once for the complete logical request, including every
+        # automatic redirect hop.  NetworkPolicy.parse() returns the shared
+        # unrestricted sentinel when allow_networks is not supplied.
+        network_policy = NetworkPolicy.parse(allow_networks)
 
         if data is not None and json is not None:
             raise ValueError(
@@ -697,6 +709,12 @@ class ClientSession:
                         traces=traces,
                         trust_env=self.trust_env,
                     )
+                    # Use a setter rather than a new constructor keyword so
+                    # custom request classes with the pre-feature __init__
+                    # signature remain source-compatible.  Parsing once and
+                    # attaching the same object gives every redirect hop the
+                    # identical decision state.
+                    req._set_network_policy(network_policy)
 
                     # connection timeout
                     try:

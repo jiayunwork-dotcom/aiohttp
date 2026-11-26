@@ -65,6 +65,7 @@ charset
 charsetdetect
 chunked
 chunking
+CIDR
 CIMultiDict
 ClientSession
 cls

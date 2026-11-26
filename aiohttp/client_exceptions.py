@@ -30,6 +30,8 @@ __all__ = (
     "ClientError",
     "ClientConnectionError",
     "ClientConnectionResetError",
+    "ClientAddressNotAllowedError",
+    "AddressNotAllowedError",
     "ClientOSError",
     "ClientConnectorError",
     "ClientProxyConnectionError",
@@ -168,6 +170,40 @@ class ClientConnectionError(ClientError):
 
 class ClientConnectionResetError(ClientConnectionError, ConnectionResetError):
     """ConnectionResetError"""
+
+
+class ClientAddressNotAllowedError(ClientConnectionError):
+    """An outbound address is not permitted by a request's allow_networks."""
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        address: object = None,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+        allow_networks: object = None,
+    ) -> None:
+        self.address = address
+        self.host = host
+        self.port = port
+        self.allow_networks = allow_networks
+        if not message:
+            target = host or "<unknown host>"
+            if port is not None:
+                target = f"{target}:{port}"
+            if address is not None:
+                message = (
+                    f"Address {address!r} for {target} is not allowed by "
+                    f"allow_networks={allow_networks!r}"
+                )
+            else:
+                message = f"No allowed address is available for {target}"
+        super().__init__(message)
+
+
+# Shorter alias used by callers that import the error directly.
+AddressNotAllowedError = ClientAddressNotAllowedError
 
 
 class ClientOSError(ClientConnectionError, OSError):

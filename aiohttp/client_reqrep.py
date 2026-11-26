@@ -62,6 +62,7 @@ from .http import (
     StreamWriter,
 )
 from .log import client_logger
+from .networks import AllowNetworksInput, NetworkPolicy
 from .streams import StreamReader
 from .typedefs import (
     DEFAULT_JSON_DECODER,
@@ -308,6 +309,8 @@ class ClientRequest:
         traces: Optional[List["Trace"]] = None,
         trust_env: bool = False,
         server_hostname: Optional[str] = None,
+        allow_networks: AllowNetworksInput = None,
+        network_policy: Optional[NetworkPolicy] = None,
     ):
         if loop is None:
             loop = asyncio.get_event_loop()
@@ -325,6 +328,10 @@ class ClientRequest:
         if TYPE_CHECKING:
             assert session is not None
         self._session = session
+        if network_policy is not None:
+            self._network_policy = network_policy
+        else:
+            self._network_policy = NetworkPolicy.parse(allow_networks)
         if params:
             url = url.extend_query(params)
         self.original_url = url
@@ -363,6 +370,15 @@ class ClientRequest:
 
     def __reset_writer(self, _: object = None) -> None:
         self.__writer = None
+
+    @property
+    def network_policy(self) -> NetworkPolicy:
+        """Immutable outbound IP policy used by this request."""
+        return self._network_policy
+
+    def _set_network_policy(self, network_policy: NetworkPolicy) -> None:
+        """Attach the session-parsed policy once to a logical request."""
+        self._network_policy = network_policy
 
     @property
     def skip_auto_headers(self) -> CIMultiDict[None]:
@@ -692,6 +708,13 @@ class ClientRequest:
             protocol.start_timeout()
 
     async def send(self, conn: "Connection") -> "ClientResponse":
+        # Re-check the actual peer immediately before touching the writer.
+        # The connector validates candidates too, but a pooled or replaced
+        # transport must never rely on an earlier DNS allow decision.
+        self._network_policy.ensure_allowed_transport(
+            conn.transport, host=self.url.raw_host, port=self.port
+        )
+
         # Specify request target:
         # - CONNECT request must send authority form URI
         # - not CONNECT proxy must send absolute form URI

@@ -423,6 +423,48 @@ The example limits amount of parallel connections to the same to `30`.
 
 The default is `0` (no limit on per host bases).
 
+Restricting outbound networks for a request
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Use ``allow_networks`` to constrain the actual outbound IP addresses for one
+logical request.  The value is a list of IPv4/IPv6 CIDR strings or
+:class:`ipaddress.IPv4Network` / :class:`ipaddress.IPv6Network` objects::
+
+    import aiohttp
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            "http://internal.example/api",
+            allow_networks=["10.0.0.0/8", "fd00::/8"],
+        ) as resp:
+            ...
+
+An empty list, ``allow_networks=[]``, is an explicit deny-all policy.
+Omitting the argument (or passing ``None``) preserves the unrestricted legacy
+behavior.  A rejected address raises
+:class:`aiohttp.ClientAddressNotAllowedError`, a subclass of
+:class:`aiohttp.ClientConnectionError`.
+
+The same immutable policy is applied to every automatic redirect hop.  It is
+also applied after DNS resolution, so a hostname whose answers mix permitted
+and rejected addresses only dials the permitted answers.  Literal IP URLs and
+answers served from the connector's DNS cache are filtered the same way.
+
+The shared DNS cache intentionally stores the complete resolver result; each
+request filters that result with its own policy.  Thus coalesced lookups and
+cache entries cannot transfer one request's allow decision to another.  The
+connection pool is also not partitioned by policy.  Every pooled connection's
+real socket peer is checked when it is selected and again in
+:meth:`aiohttp.ClientRequest.send` immediately before request headers are
+written.  A connection rejected by the current policy is not used; it can stay
+in the pool for another request whose policy permits its peer.  This maximizes
+connection reuse for overlapping policies at the cost of checking the pooled
+entries and CIDR membership on checkout.  Requests with the same policy still
+reuse live connections and cached DNS entries normally.
+
+This request-level enforcement covers direct (non-proxied) HTTP and HTTPS
+requests.
+
 Tuning the DNS cache
 ^^^^^^^^^^^^^^^^^^^^
 

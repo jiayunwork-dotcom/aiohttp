@@ -4,7 +4,9 @@ from typing import TYPE_CHECKING, Tuple
 
 from . import hdrs as hdrs
 from .client import (
+    AddressNotAllowedError,
     BaseConnector,
+    ClientAddressNotAllowedError,
     ClientConnectionError,
     ClientConnectionResetError,
     ClientConnectorCertificateError,
@@ -68,6 +70,7 @@ from .multipart import (
     content_disposition_filename as content_disposition_filename,
     parse_content_disposition as parse_content_disposition,
 )
+from .networks import NetworkPolicy as NetworkPolicy
 from .payload import (
     PAYLOAD_REGISTRY as PAYLOAD_REGISTRY,
     AsyncIterablePayload as AsyncIterablePayload,
@@ -127,6 +130,8 @@ __all__: Tuple[str, ...] = (
     "hdrs",
     # client
     "BaseConnector",
+    "ClientAddressNotAllowedError",
+    "AddressNotAllowedError",
     "ClientConnectionError",
     "ClientConnectionResetError",
     "ClientConnectorCertificateError",
@@ -181,6 +186,8 @@ __all__: Tuple[str, ...] = (
     "HttpVersion",
     "HttpVersion10",
     "HttpVersion11",
+    # networks
+    "NetworkPolicy",
     "WSMsgType",
     "WSCloseCode",
     "WSMessage",

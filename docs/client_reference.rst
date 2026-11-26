@@ -375,7 +375,7 @@ The client session supports the context manager protocol for self closing.
    .. method:: request(method, url, *, params=None, data=None, json=None,\
                          cookies=None, headers=None, skip_auto_headers=None, \
                          auth=None, allow_redirects=True,\
-                         max_redirects=10,\
+                         max_redirects=10, allow_networks=None,\
                          compress=None, chunked=None, expect100=False, raise_for_status=None,\
                          read_until_eof=True, \
                          proxy=None, proxy_auth=None,\
@@ -458,6 +458,12 @@ The client session supports the context manager protocol for self closing.
          :exc:`TooManyRedirects` is raised if the number is exceeded.
          Ignored when ``allow_redirects=False``.
          ``10`` by default.
+
+      :param allow_networks: Optional list of permitted IPv4/IPv6 CIDR
+         networks.  DNS answers and the actual peer of every new or pooled
+         connection are checked; an empty list denies all outbound addresses.
+         The same policy applies to every redirect hop.  ``None`` (default)
+         preserves unrestricted behavior.
 
       :param bool compress: Set to ``True`` if request has to be compressed
          with deflate encoding. If `compress` can not be combined
@@ -2365,6 +2371,13 @@ Connection errors
 .. class:: ClientConnectionResetError
 
    Derived from :exc:`ClientConnectionError` and :exc:`ConnectionResetError`
+
+.. class:: ClientAddressNotAllowedError
+
+   Raised when a request's ``allow_networks`` policy rejects a resolved
+   address or the actual peer of a connection.
+
+   Derived from :exc:`ClientConnectionError`
 
 .. class:: ClientOSError
 
