@@ -96,6 +96,7 @@ from .web_middlewares import (
 )
 from .web_protocol import (
     PayloadAccessError as PayloadAccessError,
+    PayloadSizeError as PayloadSizeError,
     RequestHandler as RequestHandler,
     RequestPayloadError as RequestPayloadError,
 )
@@ -229,6 +230,7 @@ __all__ = (
     "normalize_path_middleware",
     # web_protocol
     "PayloadAccessError",
+    "PayloadSizeError",
     "RequestHandler",
     "RequestPayloadError",
     # web_request

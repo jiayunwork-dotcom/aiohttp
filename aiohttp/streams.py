@@ -26,6 +26,8 @@ from .log import internal_logger
 __all__ = (
     "EMPTY_PAYLOAD",
     "EofStream",
+    "PayloadSizeError",
+    "RequestPayloadError",
     "StreamReader",
     "DataQueue",
 )
@@ -35,6 +37,26 @@ _T = TypeVar("_T")
 
 class EofStream(Exception):
     """eof stream indication."""
+
+
+class RequestPayloadError(Exception):
+    """Payload parsing error."""
+
+
+class PayloadSizeError(RequestPayloadError):
+    """A decoded request payload exceeded its configured size limit."""
+
+    def __init__(self, limit: int, actual_size: Optional[int] = None) -> None:
+        self.limit = limit
+        self.actual_size = actual_size
+        if actual_size is None:
+            message = f"Decoded body exceeds limit of {limit} bytes"
+        else:
+            message = (
+                f"Decoded body exceeds limit of {limit} bytes "
+                f"(attempted {actual_size} bytes)"
+            )
+        super().__init__(message)
 
 
 class AsyncStreamIterator(Generic[_T]):
@@ -130,6 +152,7 @@ class StreamReader(AsyncStreamReaderMixin):
         "_eof_callbacks",
         "_eof_counter",
         "total_bytes",
+        "_decoded_body_limit",
     )
 
     def __init__(
@@ -139,10 +162,12 @@ class StreamReader(AsyncStreamReaderMixin):
         *,
         timer: Optional[BaseTimerContext] = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
+        decoded_body_limit: Optional[int] = None,
     ) -> None:
         self._protocol = protocol
         self._low_water = limit
         self._high_water = limit * 2
+        self._decoded_body_limit = decoded_body_limit
         if loop is None:
             loop = asyncio.get_event_loop()
         self._loop = loop
@@ -179,6 +204,25 @@ class StreamReader(AsyncStreamReaderMixin):
 
     def exception(self) -> Optional[BaseException]:
         return self._exception
+
+    @property
+    def decoded_body_limit(self) -> Optional[int]:
+        return self._decoded_body_limit
+
+    @decoded_body_limit.setter
+    def decoded_body_limit(self, value: Optional[int]) -> None:
+        self._decoded_body_limit = value
+
+    @property
+    def decoded_body_remaining(self) -> Optional[int]:
+        """Remaining decoded-byte quota.
+
+        ``total_bytes`` is monotonic and includes bytes already consumed by the
+        application, so reading a chunk never returns quota to the decoder.
+        """
+        if self._decoded_body_limit is None:
+            return None
+        return max(0, self._decoded_body_limit - self.total_bytes)
 
     def set_exception(
         self,
@@ -276,7 +320,23 @@ class StreamReader(AsyncStreamReaderMixin):
         if not data:
             return
 
+        if isinstance(self._exception, PayloadSizeError):
+            # A terminal size rejection must not accept or account for more
+            # bytes. Re-raise the same failure that woke pending readers.
+            raise self._exception
+
         data_len = len(data)
+        decoded_body_limit = self._decoded_body_limit
+        if (
+            decoded_body_limit is not None
+            and self.total_bytes + data_len > decoded_body_limit
+        ):
+            exc = PayloadSizeError(
+                decoded_body_limit, self.total_bytes + data_len
+            )
+            self.set_exception(exc)
+            raise exc
+
         self._size += data_len
         self._buffer.append(data)
         self.total_bytes += data_len
@@ -556,6 +616,19 @@ class EmptyStreamReader(StreamReader):  # lgtm [py/missing-call-to-init]
     def __init__(self) -> None:
         self._read_eof_chunk = False
         self.total_bytes = 0
+
+    @property
+    def decoded_body_limit(self) -> Optional[int]:
+        return None
+
+    @decoded_body_limit.setter
+    def decoded_body_limit(self, value: Optional[int]) -> None:
+        # Empty streams never accept body bytes; ignore configuration.
+        pass
+
+    @property
+    def decoded_body_remaining(self) -> Optional[int]:
+        return None
 
     def __repr__(self) -> str:
         return "<%s>" % self.__class__.__name__

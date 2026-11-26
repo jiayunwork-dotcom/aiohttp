@@ -53,7 +53,7 @@ from .helpers import (
 from .http_parser import RawRequestMessage
 from .http_writer import HttpVersion
 from .multipart import BodyPartReader, MultipartReader
-from .streams import EmptyStreamReader, StreamReader
+from .streams import EmptyStreamReader, PayloadSizeError, StreamReader
 from .typedefs import (
     DEFAULT_JSON_DECODER,
     JSONDecoder,
@@ -667,17 +667,24 @@ class BaseRequest(MutableMapping[str, Any], HeadersMixin):
         """
         if self._read_bytes is None:
             body = bytearray()
-            while True:
-                chunk = await self._payload.readany()
-                body.extend(chunk)
-                if self._client_max_size:
-                    body_size = len(body)
-                    if body_size >= self._client_max_size:
-                        raise HTTPRequestEntityTooLarge(
-                            max_size=self._client_max_size, actual_size=body_size
-                        )
-                if not chunk:
-                    break
+            try:
+                while True:
+                    chunk = await self._payload.readany()
+                    body.extend(chunk)
+                    if self._client_max_size:
+                        body_size = len(body)
+                        if body_size >= self._client_max_size:
+                            raise HTTPRequestEntityTooLarge(
+                                max_size=self._client_max_size,
+                                actual_size=body_size,
+                            )
+                    if not chunk:
+                        break
+            except PayloadSizeError as exc:
+                raise HTTPRequestEntityTooLarge(
+                    max_size=exc.limit,
+                    actual_size=exc.actual_size or exc.limit + 1,
+                ) from exc
             self._read_bytes = bytes(body)
         return self._read_bytes
 
@@ -698,6 +705,17 @@ class BaseRequest(MutableMapping[str, Any], HeadersMixin):
 
     async def post(self) -> "MultiDictProxy[Union[str, bytes, FileField]]":
         """Return POST parameters."""
+        if self._post is not None:
+            return self._post
+        try:
+            return await self._post_impl()
+        except PayloadSizeError as exc:
+            raise HTTPRequestEntityTooLarge(
+                max_size=exc.limit,
+                actual_size=exc.actual_size or exc.limit + 1,
+            ) from exc
+
+    async def _post_impl(self) -> "MultiDictProxy[Union[str, bytes, FileField]]":
         if self._post is not None:
             return self._post
         if self._method not in self.POST_METHODS:
@@ -737,16 +755,26 @@ class BaseRequest(MutableMapping[str, Any], HeadersMixin):
                             None, tempfile.TemporaryFile
                         )
                         chunk = await field.read_chunk(size=2**16)
-                        while chunk:
-                            chunk = field.decode(chunk)
-                            await self._loop.run_in_executor(None, tmp.write, chunk)
-                            size += len(chunk)
-                            if 0 < max_size < size:
-                                await self._loop.run_in_executor(None, tmp.close)
-                                raise HTTPRequestEntityTooLarge(
-                                    max_size=max_size, actual_size=size
+                        try:
+                            while chunk:
+                                chunk = field.decode(chunk)
+                                await self._loop.run_in_executor(
+                                    None, tmp.write, chunk
                                 )
-                            chunk = await field.read_chunk(size=2**16)
+                                size += len(chunk)
+                                if 0 < max_size < size:
+                                    await self._loop.run_in_executor(
+                                        None, tmp.close
+                                    )
+                                    raise HTTPRequestEntityTooLarge(
+                                        max_size=max_size, actual_size=size
+                                    )
+                                chunk = await field.read_chunk(size=2**16)
+                        except PayloadSizeError:
+                            # The lower StreamReader rejected the decoded body;
+                            # close the not-yet-returned temporary upload.
+                            await self._loop.run_in_executor(None, tmp.close)
+                            raise
                         await self._loop.run_in_executor(None, tmp.seek, 0)
 
                         if field_ct is None:

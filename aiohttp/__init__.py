@@ -97,6 +97,7 @@ from .streams import (
     DataQueue as DataQueue,
     EofStream as EofStream,
     FlowControlDataQueue as FlowControlDataQueue,
+    PayloadSizeError as PayloadSizeError,
     StreamReader as StreamReader,
 )
 from .tracing import (
@@ -224,6 +225,7 @@ __all__: Tuple[str, ...] = (
     "DataQueue",
     "EMPTY_PAYLOAD",
     "EofStream",
+    "PayloadSizeError",
     "StreamReader",
     # tracing
     "TraceConfig",

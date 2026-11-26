@@ -38,9 +38,18 @@ from .http import (
 )
 from .http_exceptions import BadHttpMethod
 from .log import access_logger, server_logger
-from .streams import EMPTY_PAYLOAD, StreamReader
+from .streams import (
+    EMPTY_PAYLOAD,
+    PayloadSizeError,
+    RequestPayloadError,
+    StreamReader,
+)
 from .tcp_helpers import tcp_keepalive
-from .web_exceptions import HTTPException, HTTPInternalServerError
+from .web_exceptions import (
+    HTTPException,
+    HTTPInternalServerError,
+    HTTPRequestEntityTooLarge,
+)
 from .web_log import AccessLogger
 from .web_request import BaseRequest
 from .web_response import Response, StreamResponse
@@ -78,10 +87,6 @@ ERROR = RawRequestMessage(
     False,
     yarl.URL("/"),
 )
-
-
-class RequestPayloadError(Exception):
-    """Payload parsing error."""
 
 
 class PayloadAccessError(Exception):
@@ -172,6 +177,7 @@ class RequestHandler(BaseProtocol):
         "_request_in_progress",
         "_logging_enabled",
         "_cache",
+        "_payload_size_error",
     )
 
     def __init__(
@@ -194,8 +200,17 @@ class RequestHandler(BaseProtocol):
         read_bufsize: int = 2**16,
         auto_decompress: bool = True,
         timeout_ceil_threshold: float = 5,
+        decoded_body_limit: Optional[int] = None,
     ):
         super().__init__(loop)
+
+        if decoded_body_limit is not None:
+            if isinstance(decoded_body_limit, bool) or not isinstance(
+                decoded_body_limit, int
+            ):
+                raise TypeError("decoded_body_limit must be an int or None")
+            if decoded_body_limit <= 0:
+                raise ValueError("decoded_body_limit must be a positive integer")
 
         # _request_count is the number of requests processed with the same connection.
         self._request_count = 0
@@ -230,6 +245,7 @@ class RequestHandler(BaseProtocol):
             max_headers=max_headers,
             payload_exception=RequestPayloadError,
             auto_decompress=auto_decompress,
+            decoded_body_limit=decoded_body_limit,
         )
 
         self._timeout_ceil_threshold: float = 5
@@ -254,6 +270,7 @@ class RequestHandler(BaseProtocol):
         self._force_close = False
         self._request_in_progress = False
         self._cache: dict[str, Any] = {}
+        self._payload_size_error: Optional[PayloadSizeError] = None
 
     def __repr__(self) -> str:
         return "<{} {}>".format(
@@ -415,6 +432,10 @@ class RequestHandler(BaseProtocol):
 
             for msg, payload in messages or ():
                 self._request_count += 1
+                if isinstance(payload, StreamReader):
+                    payload_exc = payload.exception()
+                    if isinstance(payload_exc, PayloadSizeError):
+                        self.on_payload_size_exceeded(payload_exc)
                 self._messages.append((msg, payload))
 
             waiter = self._waiter
@@ -465,6 +486,41 @@ class RequestHandler(BaseProtocol):
             self.transport.close()
             self.transport = None
 
+    def on_payload_size_exceeded(self, exc: PayloadSizeError) -> None:
+        """Stop framing input after a decoded body limit rejection.
+
+        The same exception remains on the StreamReader for waiting
+        application reads.  Marking the protocol closed ensures bytes already
+        in flight, including a pipelined request, are never parsed as a new
+        HTTP message.
+        """
+        if self._payload_size_error is None:
+            self._payload_size_error = exc
+        # Set the flag directly instead of close(): when headers and the whole
+        # body arrive together, start() may still be waiting on _waiter and the
+        # parsed request must be enqueued and allowed to emit its 413 response.
+        self._close = True
+        self.pause_reading()
+
+    def _payload_size_response(
+        self, request: BaseRequest, exc: PayloadSizeError
+    ) -> StreamResponse:
+        self.on_payload_size_exceeded(exc)
+        if request.writer.output_size > 0:
+            raise ConnectionError(
+                "Response is sent already, cannot send 413 response "
+                "for decoded body limit"
+            ) from exc
+
+        actual_size = exc.actual_size
+        if actual_size is None:
+            actual_size = exc.limit + 1
+        resp = HTTPRequestEntityTooLarge(
+            max_size=exc.limit, actual_size=actual_size
+        )
+        resp.force_close()
+        return resp
+
     def log_access(
         self, request: BaseRequest, response: StreamResponse, time: Optional[float]
     ) -> None:
@@ -508,10 +564,24 @@ class RequestHandler(BaseProtocol):
             try:
                 self._current_request = request
                 resp = await request_handler(request)
+                # A handler may return without reading a body that was already
+                # rejected while data was fed into the StreamReader.
+                payload_exc = request.content.exception()
+                if isinstance(payload_exc, PayloadSizeError):
+                    raise payload_exc
             finally:
                 self._current_request = None
         except HTTPException as exc:
+            if (
+                self._payload_size_error is not None
+                and exc.status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+            ):
+                self._close = True
+                exc.force_close()
             resp = exc
+            resp, reset = await self.finish_response(request, resp, start_time)
+        except PayloadSizeError as exc:
+            resp = self._payload_size_response(request, exc)
             resp, reset = await self.finish_response(request, resp, start_time)
         except asyncio.CancelledError:
             raise
@@ -614,7 +684,14 @@ class RequestHandler(BaseProtocol):
                 self._keepalive = bool(resp.keep_alive)
 
                 # check payload
-                if not payload.is_eof():
+                payload_size_exceeded = isinstance(
+                    payload.exception(), PayloadSizeError
+                )
+                if payload_size_exceeded:
+                    # The 413 path has already marked the connection closed.
+                    # Do not drain/linger on a rejected decompression bomb.
+                    self._close = True
+                elif not payload.is_eof():
                     lingering_time = self._lingering_time
                     if not self._force_close and lingering_time:
                         self.log_debug(
@@ -643,7 +720,8 @@ class RequestHandler(BaseProtocol):
                         self.log_debug("Uncompleted request.")
                         self.close()
 
-                payload.set_exception(_PAYLOAD_ACCESS_ERROR)
+                if not payload_size_exceeded:
+                    payload.set_exception(_PAYLOAD_ACCESS_ERROR)
 
             except asyncio.CancelledError:
                 self.log_debug("Ignored premature client disconnection")
@@ -668,6 +746,10 @@ class RequestHandler(BaseProtocol):
                     self._keepalive_handle = loop.call_at(
                         close_time, self._process_keepalive
                     )
+            elif self._messages:
+                # A terminal message such as the 413 request is already queued.
+                # Serve it before closing, but do not wait for/new input.
+                continue
             else:
                 break
 

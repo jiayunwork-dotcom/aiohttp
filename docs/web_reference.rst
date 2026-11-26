@@ -2820,6 +2820,12 @@ application on specific TCP or Unix socket, e.g.::
 
       .. versionadded:: 3.8
 
+   :param decoded_body_limit: Maximum number of decoded request body bytes
+      accepted for each request.  Compressed requests are measured after
+      ``gzip`` or ``deflate`` decoding; uncompressed requests are measured as
+      received.  ``None`` (the default) disables the limit.  A positive integer
+      allows bodies whose decoded size is less than or equal to the limit.
+
 
    .. attribute:: app
 

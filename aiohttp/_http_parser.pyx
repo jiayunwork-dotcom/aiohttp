@@ -38,7 +38,11 @@ from .http_writer import (
     HttpVersion10 as _HttpVersion10,
     HttpVersion11 as _HttpVersion11,
 )
-from .streams import EMPTY_PAYLOAD as _EMPTY_PAYLOAD, StreamReader as _StreamReader
+from .streams import (
+    EMPTY_PAYLOAD as _EMPTY_PAYLOAD,
+    PayloadSizeError as _PayloadSizeError,
+    StreamReader as _StreamReader,
+)
 
 cimport cython
 
@@ -69,6 +73,7 @@ cdef object HttpVersion11 = _HttpVersion11
 cdef object SEC_WEBSOCKET_KEY1 = hdrs.SEC_WEBSOCKET_KEY1
 cdef object CONTENT_ENCODING = hdrs.CONTENT_ENCODING
 cdef object EMPTY_PAYLOAD = _EMPTY_PAYLOAD
+cdef object PayloadSizeError = _PayloadSizeError
 cdef object StreamReader = _StreamReader
 cdef object DeflateBuffer = _DeflateBuffer
 cdef bytes EMPTY_BYTES = b""
@@ -306,6 +311,7 @@ cdef class HttpParser:
         object  _payload_exception
         object  _last_error
         bint    _auto_decompress
+        object  _decoded_body_limit
         int     _limit
 
         str     _content_encoding
@@ -334,7 +340,7 @@ cdef class HttpParser:
         size_t max_line_size=8190, size_t max_headers=32768,
         size_t max_field_size=8190, payload_exception=None,
         bint response_with_body=True, bint read_until_eof=False,
-        bint auto_decompress=True,
+        bint auto_decompress=True, object decoded_body_limit=None,
     ):
         cparser.llhttp_settings_init(self._csettings)
         cparser.llhttp_init(self._cparser, mode, self._csettings)
@@ -362,6 +368,7 @@ cdef class HttpParser:
         self._read_until_eof = read_until_eof
         self._upgraded = False
         self._auto_decompress = auto_decompress
+        self._decoded_body_limit = decoded_body_limit
         self._content_encoding = None
 
         self._csettings.on_url = cb_on_url
@@ -461,7 +468,8 @@ cdef class HttpParser:
         ):
             payload = StreamReader(
                 self._protocol, timer=self._timer, loop=self._loop,
-                limit=self._limit)
+                limit=self._limit,
+                decoded_body_limit=self._decoded_body_limit)
         else:
             payload = EMPTY_PAYLOAD
 
@@ -579,12 +587,12 @@ cdef class HttpRequestParser(HttpParser):
         size_t max_line_size=8190, size_t max_headers=32768,
         size_t max_field_size=8190, payload_exception=None,
         bint response_with_body=True, bint read_until_eof=False,
-        bint auto_decompress=True,
+        bint auto_decompress=True, object decoded_body_limit=None,
     ):
         self._init(cparser.HTTP_REQUEST, protocol, loop, limit, timer,
                    max_line_size, max_headers, max_field_size,
                    payload_exception, response_with_body, read_until_eof,
-                   auto_decompress)
+                   auto_decompress, decoded_body_limit)
 
     cdef object _on_status_complete(self):
         cdef int idx1, idx2
@@ -643,12 +651,12 @@ cdef class HttpResponseParser(HttpParser):
             size_t max_line_size=8190, size_t max_headers=32768,
             size_t max_field_size=8190, payload_exception=None,
             bint response_with_body=True, bint read_until_eof=False,
-            bint auto_decompress=True
+            bint auto_decompress=True, object decoded_body_limit=None
     ):
         self._init(cparser.HTTP_RESPONSE, protocol, loop, limit, timer,
                    max_line_size, max_headers, max_field_size,
                    payload_exception, response_with_body, read_until_eof,
-                   auto_decompress)
+                   auto_decompress, decoded_body_limit)
         # Use strict parsing on dev mode, so users are warned about broken servers.
         if not DEBUG:
             cparser.llhttp_set_lenient_headers(self._cparser, 1)
@@ -762,9 +770,18 @@ cdef int cb_on_body(cparser.llhttp_t* parser,
     try:
         pyparser._payload.feed_data(body, length)
     except BaseException as underlying_exc:
-        reraised_exc = underlying_exc
-        if pyparser._payload_exception is not None:
-            reraised_exc = pyparser._payload_exception(str(underlying_exc))
+        if isinstance(underlying_exc, PayloadSizeError):
+            reraised_exc = underlying_exc
+            protocol = pyparser._protocol
+            on_size_exceeded = getattr(
+                protocol, "on_payload_size_exceeded", None
+            )
+            if callable(on_size_exceeded):
+                on_size_exceeded(reraised_exc)
+        else:
+            reraised_exc = underlying_exc
+            if pyparser._payload_exception is not None:
+                reraised_exc = pyparser._payload_exception(str(underlying_exc))
 
         set_exception(pyparser._payload, reraised_exc, underlying_exc)
 

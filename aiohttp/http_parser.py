@@ -48,7 +48,7 @@ from .http_exceptions import (
     TransferEncodingError,
 )
 from .http_writer import HttpVersion, HttpVersion10
-from .streams import EMPTY_PAYLOAD, StreamReader
+from .streams import EMPTY_PAYLOAD, PayloadSizeError, StreamReader
 from .typedefs import RawHeaders
 
 __all__ = (
@@ -253,6 +253,7 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
         response_with_body: bool = True,
         read_until_eof: bool = False,
         auto_decompress: bool = True,
+        decoded_body_limit: Optional[int] = None,
     ) -> None:
         self.protocol = protocol
         self.loop = loop
@@ -272,6 +273,7 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
         self._payload = None
         self._payload_parser: Optional[HttpPayloadParser] = None
         self._auto_decompress = auto_decompress
+        self._decoded_body_limit = decoded_body_limit
         self._limit = limit
         self._headers_parser = HeadersParser(
             max_line_size, max_headers, max_field_size, self.lax
@@ -389,6 +391,7 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
                                 timer=self.timer,
                                 loop=loop,
                                 limit=self._limit,
+                                decoded_body_limit=self._decoded_body_limit,
                             )
                             payload_parser = HttpPayloadParser(
                                 payload,
@@ -400,6 +403,7 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
                                 response_with_body=self.response_with_body,
                                 auto_decompress=self._auto_decompress,
                                 lax=self.lax,
+                                decoded_body_limit=self._decoded_body_limit,
                             )
                             if not payload_parser.done:
                                 self._payload_parser = payload_parser
@@ -410,6 +414,7 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
                                 timer=self.timer,
                                 loop=loop,
                                 limit=self._limit,
+                                decoded_body_limit=self._decoded_body_limit,
                             )
                             self._upgraded = True
                             self._payload_parser = HttpPayloadParser(
@@ -418,6 +423,7 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
                                 compression=msg.compression,
                                 auto_decompress=self._auto_decompress,
                                 lax=self.lax,
+                                decoded_body_limit=self._decoded_body_limit,
                             )
                         elif not empty_body and length is None and self.read_until_eof:
                             payload = StreamReader(
@@ -425,6 +431,7 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
                                 timer=self.timer,
                                 loop=loop,
                                 limit=self._limit,
+                                decoded_body_limit=self._decoded_body_limit,
                             )
                             payload_parser = HttpPayloadParser(
                                 payload,
@@ -436,6 +443,7 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
                                 response_with_body=self.response_with_body,
                                 auto_decompress=self._auto_decompress,
                                 lax=self.lax,
+                                decoded_body_limit=self._decoded_body_limit,
                             )
                             if not payload_parser.done:
                                 self._payload_parser = payload_parser
@@ -461,9 +469,24 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
                 try:
                     eof, data = self._payload_parser.feed_data(data[start_pos:], SEP)
                 except BaseException as underlying_exc:
-                    reraised_exc = underlying_exc
-                    if self.payload_exception is not None:
-                        reraised_exc = self.payload_exception(str(underlying_exc))
+                    reraised_exc: BaseException
+                    if isinstance(underlying_exc, PayloadSizeError):
+                        # Preserve the exact limit failure: the StreamReader has
+                        # already woken pending readers, and RequestHandler uses
+                        # it to emit 413 and close before parsing more input.
+                        reraised_exc = underlying_exc
+                        protocol = self.protocol
+                        on_size_exceeded = getattr(
+                            protocol, "on_payload_size_exceeded", None
+                        )
+                        if callable(on_size_exceeded):
+                            on_size_exceeded(reraised_exc)
+                    else:
+                        reraised_exc = underlying_exc
+                        if self.payload_exception is not None:
+                            reraised_exc = self.payload_exception(
+                                str(underlying_exc)
+                            )
 
                     set_exception(
                         self._payload_parser.payload,
@@ -764,6 +787,7 @@ class HttpPayloadParser:
         response_with_body: bool = True,
         auto_decompress: bool = True,
         lax: bool = False,
+        decoded_body_limit: Optional[int] = None,
     ) -> None:
         self._length = 0
         self._type = ParseState.PARSE_UNTIL_EOF
@@ -772,12 +796,19 @@ class HttpPayloadParser:
         self._chunk_tail = b""
         self._auto_decompress = auto_decompress
         self._lax = lax
+        self._decoded_body_limit = decoded_body_limit
         self.done = False
+
+        if (
+            decoded_body_limit is not None
+            and payload.decoded_body_limit is None
+        ):
+            payload.decoded_body_limit = decoded_body_limit
 
         # payload decompression wrapper
         if response_with_body and compression and self._auto_decompress:
             real_payload: Union[StreamReader, DeflateBuffer] = DeflateBuffer(
-                payload, compression
+                payload, compression, decoded_body_limit=decoded_body_limit
             )
         else:
             real_payload = payload
@@ -951,11 +982,28 @@ class DeflateBuffer:
 
     decompressor: Any
 
-    def __init__(self, out: StreamReader, encoding: Optional[str]) -> None:
+    # Bound one decompressor call and one buffered output batch.  This keeps a
+    # highly compressible payload from turning a tiny remaining quota into a
+    # multi-megabyte bytes object before the limit is checked.
+    _MAX_OUTPUT_CHUNK: Final[int] = 64 * 1024
+
+    def __init__(
+        self,
+        out: StreamReader,
+        encoding: Optional[str],
+        decoded_body_limit: Optional[int] = None,
+    ) -> None:
         self.out = out
         self.size = 0
         self.encoding = encoding
         self._started_decoding = False
+        self._decoded_body_limit = decoded_body_limit
+
+        if (
+            decoded_body_limit is not None
+            and getattr(out, "decoded_body_limit", None) is None
+        ):
+            out.decoded_body_limit = decoded_body_limit
 
         self.decompressor: Union[BrotliDecompressor, ZLibDecompressor]
         if encoding == "br":
@@ -995,20 +1043,58 @@ class DeflateBuffer:
                 encoding=self.encoding, suppress_deflate_header=True
             )
 
-        try:
-            chunk = self.decompressor.decompress_sync(chunk)
-        except Exception:
-            raise ContentEncodingError(
-                "Can not decode content-encoding: %s" % self.encoding
-            )
+        if self.out.decoded_body_limit is None or not isinstance(
+            self.decompressor, ZLibDecompressor
+        ):
+            try:
+                output = self.decompressor.decompress_sync(chunk)
+            except Exception:
+                raise ContentEncodingError(
+                    "Can not decode content-encoding: %s" % self.encoding
+                )
 
-        self._started_decoding = True
+            self._started_decoding = True
+            if output:
+                # StreamReader is the single ledger.  Its total includes bytes
+                # already consumed by the application and never moves backwards.
+                self.out.feed_data(output, len(output))
+            return
 
-        if chunk:
-            self.out.feed_data(chunk, len(chunk))
+        # zlib's max_length makes the decompressor stop after a bounded amount
+        # of output and leaves the unconsumed input in unconsumed_tail.  Ask for
+        # at most one byte beyond the remaining quota so the rejection is exact
+        # without first expanding the whole bomb.
+        while chunk:
+            remaining = self.out.decoded_body_remaining
+            assert remaining is not None
+            max_length = min(self._MAX_OUTPUT_CHUNK, remaining + 1)
+
+            try:
+                output = self.decompressor.decompress_sync(chunk, max_length)
+            except Exception:
+                raise ContentEncodingError(
+                    "Can not decode content-encoding: %s" % self.encoding
+                )
+
+            self._started_decoding = True
+
+            if output:
+                self.out.feed_data(output, len(output))
+
+            chunk = self.decompressor.unconsumed_tail
+            if not chunk:
+                break
 
     def feed_eof(self) -> None:
-        chunk = self.decompressor.flush()
+        if self.out.decoded_body_limit is not None and isinstance(
+            self.decompressor, ZLibDecompressor
+        ):
+            # The feed_data loop normally drains all output.  Pass a bounded
+            # initial buffer here as defense in depth; StreamReader still owns
+            # the hard quota check.
+            chunk = self.decompressor.flush(self._MAX_OUTPUT_CHUNK)
+        else:
+            chunk = self.decompressor.flush()
 
         if chunk or self.size > 0:
             self.out.feed_data(chunk, len(chunk))
